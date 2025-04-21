@@ -408,6 +408,7 @@
                             <span class="badge badge-cpu">CPU: ${pod.cpuRequirement} cores</span>
                             <span class="badge bg-secondary ms-2">Node: ${pod.nodeId}</span>
                         </p>
+                        <div class="container-id">Container ID: ${pod.containerId}</div>
                         <div class="mt-2">
                             <small class="text-muted">Created: ${new Date(pod.createdAt).toLocaleTimeString()}</small>
                         </div>
@@ -572,7 +573,7 @@
                 const data = await response.json();
                 
                 if (data.success) {
-                    showNotification('Success', `Pod ${data.pod.id} launched successfully on node ${data.pod.nodeId} (Container ID: ${data.node.containerId})`);
+                    showNotification('Success', `Pod ${data.pod.id} launched successfully on node ${data.pod.nodeId} (Container ID: ${data.pod.containerId})`);
                     document.getElementById('launch-pod-form').reset();
                     fetchPods();
                     fetchNodes(); // Refresh nodes to show updated resource usage

@@ -23,20 +23,104 @@ const SCHEDULING_ALGORITHMS = {
 // Default scheduling algorithm
 let currentSchedulingAlgorithm = SCHEDULING_ALGORITHMS.FIRST_FIT
 
+// Docker operations
+class DockerManager {
+  // Check if a container with the given name exists
+  static checkContainerExists(containerName) {
+    return new Promise((resolve, reject) => {
+      exec(`docker ps -a --filter "name=^/${containerName}$" --format "{{.Names}}"`, (error, stdout, stderr) => {
+        if (error) {
+          console.error(`Error checking container: ${error.message}`)
+          reject(error)
+          return
+        }
+        
+        // If stdout contains the container name, it exists
+        resolve(stdout.trim() === containerName)
+      })
+    })
+  }
+  
+  // Generate a unique container name to avoid conflicts
+  static generateUniqueContainerName(baseName) {
+    return `${baseName}-${Date.now()}`
+  }
+  
+  // Remove a container if it exists
+  static removeContainer(containerName) {
+    return new Promise((resolve, reject) => {
+      exec(`docker rm -f ${containerName}`, (error, stdout, stderr) => {
+        if (error) {
+          console.error(`Error removing container: ${error.message}`)
+          reject(error)
+          return
+        }
+        
+        resolve(stdout.trim())
+      })
+    })
+  }
+  
+  // Launch a container for a pod - returns the container ID
+  static launchPodContainer(containerName, nodeId) {
+    return new Promise((resolve, reject) => {
+      // Get the associated node's container ID to establish linking
+      const node = nodes.get(nodeId)
+      if (!node) {
+        reject(new Error(`Node ${nodeId} not found`))
+        return
+      }
+      
+      exec(`docker run -d --name ${containerName} --label node=${nodeId} --label type=pod alpine sh -c "while true; do sleep 60; done"`, (error, stdout, stderr) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        
+        resolve(stdout.trim()) // Return the container ID
+      })
+    })
+  }
+  
+  // Launch a container for a node - returns the container ID
+  static launchNodeContainer(containerName) {
+    return new Promise((resolve, reject) => {
+      exec(`docker run -d --name ${containerName} --label type=cluster-node alpine sh -c "while true; do sleep 60; done"`, (error, stdout, stderr) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        
+        resolve(stdout.trim()) // Return the container ID
+      })
+    })
+  }
+  
+  // Get container information including ID
+  static getContainerInfo(containerName) {
+    return new Promise((resolve, reject) => {
+      exec(`docker inspect --format="{{.Id}}" ${containerName}`, (error, stdout, stderr) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        
+        resolve(stdout.trim()) // Return the container ID
+      })
+    })
+  }
+}
+
 // Node Manager
 class NodeManager {
-  static addNode(nodeId, cpuCores, containerId = null) {
+  static async addNode(nodeId, cpuCores, containerId = null) {
     if (nodes.has(nodeId)) {
       return { success: false, message: `Node ${nodeId} already exists` }
     }
 
-    if (!containerId) {
-      containerId = `container-${Date.now()}-${Math.floor(Math.random() * 10000)}`
-    }
-
     const newNode = {
       id: nodeId,
-      containerId: containerId,
+      containerId: containerId || `container-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
       cpuCores: cpuCores,
       availableCpuCores: cpuCores,
       pods: [],
@@ -115,7 +199,7 @@ class NodeManager {
 
 // Pod Scheduler
 class PodScheduler {
-  static schedulePod(cpuRequirement) {
+  static async schedulePod(cpuRequirement) {
     const podId = `pod-${Date.now()}-${Math.floor(Math.random() * 1000)}`
 
     // Find a suitable node based on the current scheduling algorithm
@@ -130,18 +214,34 @@ class PodScheduler {
     node.availableCpuCores -= cpuRequirement
     node.pods.push(podId)
 
-    // Create pod record
-    const pod = {
-      id: podId,
-      cpuRequirement,
-      nodeId,
-      status: "running",
-      createdAt: Date.now(),
+    // Generate a unique container name for the pod
+    const containerName = DockerManager.generateUniqueContainerName(`pod-${podId}`)
+    
+    try {
+      // Launch a Docker container for the pod
+      const containerId = await DockerManager.launchPodContainer(containerName, nodeId)
+      
+      // Create pod record
+      const pod = {
+        id: podId,
+        cpuRequirement,
+        nodeId,
+        containerId: containerId, 
+        status: "running",
+        createdAt: Date.now(),
+      }
+
+      pods.set(podId, pod)
+      return { success: true, pod, node }
+    } catch (error) {
+      console.error(`Error launching pod container: ${error.message}`)
+      
+      // Free up the resources since pod creation failed
+      node.availableCpuCores += cpuRequirement
+      node.pods = node.pods.filter(id => id !== podId)
+      
+      return { success: false, message: `Failed to create pod container: ${error.message}` }
     }
-
-    pods.set(podId, pod)
-
-    return { success: true, pod, node }
   }
 
   static _findSuitableNode(cpuRequirement) {
@@ -209,7 +309,7 @@ class PodScheduler {
     return { success: true, pod }
   }
 
-  static removePod(podId) {
+  static async removePod(podId) {
     const pod = pods.get(podId)
     if (!pod) {
       return { success: false, message: `Pod ${podId} not found` }
@@ -222,11 +322,20 @@ class PodScheduler {
       node.pods = node.pods.filter((id) => id !== podId)
     }
 
+    // Remove the Docker container
+    try {
+      await DockerManager.removeContainer(pod.containerId)
+      console.log(`Container for pod ${podId} removed successfully`)
+    } catch (error) {
+      console.error(`Error removing container for pod ${podId}: ${error.message}`)
+      // We'll still remove the pod from our system even if container removal fails
+    }
+
     pods.delete(podId)
     return { success: true, message: `Pod ${podId} removed successfully` }
   }
 
-  static reschedulePod(podId) {
+  static async reschedulePod(podId) {
     const pod = pods.get(podId)
     if (!pod) {
       return { success: false, message: `Pod ${podId} not found` }
@@ -251,9 +360,40 @@ class PodScheduler {
     newNode.pods.push(podId)
     newNode.availableCpuCores -= pod.cpuRequirement
     pod.nodeId = newNodeId
-    pod.status = "running"
-
-    return { success: true, pod }
+    
+    try {
+      // Remove the old container
+      try {
+        await DockerManager.removeContainer(pod.containerId)
+      } catch (error) {
+        console.error(`Error removing old container for pod ${podId}: ${error.message}`)
+        // Continue with pod rescheduling even if container removal fails
+      }
+      
+      // Create a new container for the pod on the new node
+      const containerName = DockerManager.generateUniqueContainerName(`pod-${podId}`)
+      const containerId = await DockerManager.launchPodContainer(containerName, newNodeId)
+      
+      // Update the pod's container ID
+      pod.containerId = containerId
+      pod.status = "running"
+      
+      return { success: true, pod }
+    } catch (error) {
+      // Revert the node resource changes if container creation fails
+      newNode.pods = newNode.pods.filter(id => id !== podId)
+      newNode.availableCpuCores += pod.cpuRequirement
+      
+      if (currentNode) {
+        currentNode.pods.push(podId)
+        currentNode.availableCpuCores -= pod.cpuRequirement
+        pod.nodeId = currentNode.id
+      } else {
+        pod.status = "error"
+      }
+      
+      return { success: false, message: `Failed to reschedule pod: ${error.message}` }
+    }
   }
 
   static setSchedulingAlgorithm(algorithm) {
@@ -285,7 +425,7 @@ class HealthMonitor {
     }
   }
 
-  static handleNodeFailure(nodeId) {
+  static async handleNodeFailure(nodeId) {
     const node = nodes.get(nodeId)
     if (!node) return
 
@@ -296,7 +436,7 @@ class HealthMonitor {
 
     // Reschedule each pod
     for (const podId of nodePods) {
-      const result = PodScheduler.reschedulePod(podId)
+      const result = await PodScheduler.reschedulePod(podId)
       console.log(`Rescheduling pod ${podId}: ${result.success ? "Success" : "Failed"}`)
     }
   }
@@ -312,41 +452,6 @@ class HealthMonitor {
   }
 }
 
-// Docker operations
-class DockerManager {
-  // Check if a container with the given name exists
-  static checkContainerExists(containerName, callback) {
-    exec(`docker ps -a --filter "name=^/${containerName}$" --format "{{.Names}}"`, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Error checking container: ${error.message}`)
-        callback(error, false)
-        return
-      }
-      
-      // If stdout contains the container name, it exists
-      callback(null, stdout.trim() === containerName)
-    })
-  }
-  
-  // Generate a unique container name to avoid conflicts
-  static generateUniqueContainerName(baseName) {
-    return `${baseName}-${Date.now()}`
-  }
-  
-  // Remove a container if it exists
-  static removeContainer(containerName, callback) {
-    exec(`docker rm -f ${containerName}`, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Error removing container: ${error.message}`)
-        callback(error)
-        return
-      }
-      
-      callback(null, stdout.trim())
-    })
-  }
-}
-
 // Start health check interval
 setInterval(() => {
   HealthMonitor.checkNodeHealth()
@@ -355,7 +460,7 @@ setInterval(() => {
 // API Routes
 
 // Node operations
-app.post("/api/nodes", (req, res) => {
+app.post("/api/nodes", async (req, res) => {
   const { nodeId, cpuCores } = req.body
 
   if (!nodeId || !cpuCores) {
@@ -369,25 +474,17 @@ app.post("/api/nodes", (req, res) => {
   // Generate a unique container name to avoid conflicts
   const containerName = DockerManager.generateUniqueContainerName(nodeId)
   
-  console.log(`Attempting to launch container with name ${containerName} for node ${nodeId} with ${cpuCores} CPU cores`)
-  
-  // Try to launch a Docker container with the unique name
-  exec(`docker run -d --name ${containerName} --label type=cluster-node alpine sh -c "while true; do sleep 5; done"`, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`Error launching Docker container: ${error.message}`)
-      console.log("Falling back to simulation mode...")
-      
-      // If Docker fails, fall back to simulation mode
-      const result = NodeManager.addNode(nodeId, parseInt(cpuCores))
-      return res.json(result)
-    }
+  try {
+    // Launch a Docker container for the node
+    const containerId = await DockerManager.launchNodeContainer(containerName)
     
-    // Docker container launched successfully
-    const containerId = stdout.trim()
-    console.log(`Container launched with ID: ${containerId}`)
-    const result = NodeManager.addNode(nodeId, parseInt(cpuCores), containerId)
-    return res.json(result)
-  })
+    // Add the node to our system
+    const result = await NodeManager.addNode(nodeId, parseInt(cpuCores), containerId)
+    res.json(result)
+  } catch (error) {
+    console.error(`Error creating node: ${error.message}`)
+    res.status(500).json({ success: false, message: `Failed to create node: ${error.message}` })
+  }
 })
 
 app.get("/api/nodes", (req, res) => {
@@ -419,7 +516,7 @@ app.put("/api/nodes/:nodeId", (req, res) => {
   }
 })
 
-app.delete("/api/nodes/:nodeId", (req, res) => {
+app.delete("/api/nodes/:nodeId", async (req, res) => {
   const { nodeId } = req.params
   const node = NodeManager.getNode(nodeId)
   
@@ -427,36 +524,27 @@ app.delete("/api/nodes/:nodeId", (req, res) => {
     return res.status(404).json({ success: false, message: `Node ${nodeId} not found` })
   }
   
-  // If this is a real Docker container, try to remove it first
-  if (node.containerId && node.containerId.startsWith('container-') === false) {
-    exec(`docker rm -f ${node.containerId}`, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Error removing container: ${error.message}`)
-        // Continue with node removal even if container removal fails
-      } else {
-        console.log(`Container ${node.containerId} removed successfully`)
-      }
-      
-      const result = NodeManager.removeNode(nodeId)
-      if (result.success) {
-        res.json(result)
-      } else {
-        res.status(400).json(result)
-      }
-    })
-  } else {
-    // For simulated nodes, just remove from our records
-    const result = NodeManager.removeNode(nodeId)
-    if (result.success) {
-      res.json(result)
-    } else {
-      res.status(400).json(result)
-    }
+  // Check if node has pods
+  const result = NodeManager.removeNode(nodeId)
+  if (!result.success) {
+    return res.status(400).json(result)
   }
+  
+  // Remove the Docker container
+  try {
+    await DockerManager.removeContainer(node.containerId)
+    console.log(`Container for node ${nodeId} removed successfully`)
+  } catch (error) {
+    console.error(`Error removing container for node ${nodeId}: ${error.message}`)
+    // We'll still consider the node removal successful even if container removal fails
+  }
+  
+  res.json(result)
 })
 
 app.post("/api/nodes/:nodeId/heartbeat", (req, res) => {
   const { nodeId } = req.params
+  // Fix: Use the nodeId directly from the URL parameter
   const success = HealthMonitor.recordHeartbeat(nodeId)
 
   if (success) {
@@ -467,7 +555,7 @@ app.post("/api/nodes/:nodeId/heartbeat", (req, res) => {
 })
 
 // Pod operations
-app.post("/api/pods", (req, res) => {
+app.post("/api/pods", async (req, res) => {
   const { cpuRequirement } = req.body
 
   if (!cpuRequirement) {
@@ -478,8 +566,13 @@ app.post("/api/pods", (req, res) => {
     return res.status(400).json({ success: false, message: "CPU requirement must be a positive number" })
   }
 
-  const result = PodScheduler.schedulePod(Number.parseInt(cpuRequirement))
-  res.json(result)
+  try {
+    const result = await PodScheduler.schedulePod(Number.parseInt(cpuRequirement))
+    res.json(result)
+  } catch (error) {
+    console.error("Error scheduling pod:", error)
+    res.status(500).json({ success: false, message: `Failed to schedule pod: ${error.message}` })
+  }
 })
 
 app.get("/api/pods", (req, res) => {
@@ -516,14 +609,19 @@ app.put("/api/pods/:podId", (req, res) => {
   }
 })
 
-app.delete("/api/pods/:podId", (req, res) => {
+app.delete("/api/pods/:podId", async (req, res) => {
   const { podId } = req.params
-  const result = PodScheduler.removePod(podId)
-
-  if (result.success) {
-    res.json(result)
-  } else {
-    res.status(400).json(result)
+  
+  try {
+    const result = await PodScheduler.removePod(podId)
+    if (result.success) {
+      res.json(result)
+    } else {
+      res.status(400).json(result)
+    }
+  } catch (error) {
+    console.error("Error removing pod:", error)
+    res.status(500).json({ success: false, message: `Failed to remove pod: ${error.message}` })
   }
 })
 
@@ -548,4 +646,5 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
+  console.log("Make sure Docker is running to create real containers")
 })
