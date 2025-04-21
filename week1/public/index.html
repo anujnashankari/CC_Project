@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Node Manager</title>
+    <script>
+        async function addNode() {
+            const nodeId = prompt("Enter Node ID:");
+            const cpuCores = prompt("Enter CPU Cores:");
+            if (!nodeId || !cpuCores) return alert("Both fields are required!");
+
+            const response = await fetch('/addNode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nodeId, cpuCores })
+            });
+            const data = await response.json();
+            alert(data.message);
+        }
+
+        async function deleteNode() {
+            const nodeId = prompt("Enter Node ID to delete:");
+            if (!nodeId) return alert("Node ID is required!");
+
+            const response = await fetch('/removeNode', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nodeId })
+            });
+            const data = await response.json();
+            alert(data.message);
+        }
+
+        async function updateNode() {
+            const nodeId = prompt("Enter Node ID to update:");
+            const status = prompt("Enter new status (Healthy/Unhealthy):");
+            if (!nodeId || !status) return alert("Both fields are required!");
+
+            const response = await fetch('/updateNodeStatus', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nodeId, status })
+            });
+            const data = await response.json();
+            alert(data.message);
+        }
+
+        async function viewNodes() {
+            const response = await fetch('/nodes');
+            const nodes = await response.json();
+            alert(JSON.stringify(nodes, null, 2));
+        }
+    </script>
+</head>
+<body>
+    <h1>Node Manager API</h1>
+    <button onclick="addNode()">Add Node</button>
+    <button onclick="updateNode()">Update Node</button>
+    <button onclick="deleteNode()">Delete Node</button>
+    <button onclick="viewNodes()">View Nodes</button>
+</body>
+</html>
